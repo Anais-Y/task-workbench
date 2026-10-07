@@ -1,0 +1,17 @@
+{
+  "_instructions": "复制为 adapters.json 后设置本机可执行文件并启用；修改后重启工作台。command 必须是参数数组，prompt 从 stdin 读取。planArgs 必须使执行器只读。",
+  "_protocol": "每行一个 JSON 事件：message/progress 的 message 字段、session 的 sessionId、artifact 的 artifact 对象、error 的 message；最后输出 {\"type\":\"result\",\"ok\":true,\"text\":\"结果\",\"sessionId\":\"可选\",\"artifacts\":[]}。非零退出码、error 事件或缺少 result 均算失败。也支持 protocol:text，以 stdout 和退出码作为结果。",
+  "adapters": [
+    {
+      "id": "my-agent",
+      "name": "我的 Agent",
+      "enabled": false,
+      "description": "替换为你的 CLI；计划模式权限由这个 CLI 的参数保证。",
+      "command": ["/absolute/path/to/my-agent", "run"],
+      "protocol": "taskboard-jsonl",
+      "planArgs": ["--read-only"],
+      "executeArgs": [],
+      "resumeArgs": ["--resume", "{session_id}"]
+    }
+  ]
+}
