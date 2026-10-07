@@ -1,4 +1,5 @@
 import json
+import http.client
 import os
 import shutil
 import socket
@@ -6,13 +7,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import unittest
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
+from unittest.mock import patch
 
 from taskboard.cli import Client, ensure_initial_project
 from taskboard.store import Store
+from taskboard.server import make_server
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,6 +26,33 @@ def unused_port():
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         return sock.getsockname()[1]
+
+
+class ResolverIndependentServerTests(unittest.TestCase):
+    def test_loopback_start_and_health_do_not_require_dns(self):
+        # Exercise the real server constructor, bind/listen and HTTP exchange;
+        # only the external DNS functions are forbidden, not our server code.
+        for host in ('127.0.0.1', 'localhost'):
+            with self.subTest(host=host), \
+                    patch('socket.getfqdn', side_effect=AssertionError('Unexpected reverse DNS lookup')) as fqdn, \
+                    patch('socket.gethostbyaddr', side_effect=AssertionError('Unexpected reverse DNS lookup')) as reverse:
+                server = make_server(None, None, None, host=host, port=0)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=1)
+                try:
+                    self.assertEqual(server.server_name, '127.0.0.1')
+                    connection.request('GET', '/api/health')
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertTrue(json.loads(response.read())['ok'])
+                    fqdn.assert_not_called()
+                    reverse.assert_not_called()
+                finally:
+                    connection.close()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
 
 
 class InitialProjectTests(unittest.TestCase):

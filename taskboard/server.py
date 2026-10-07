@@ -11,6 +11,7 @@ import re
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from urllib.parse import unquote, urlsplit
 
 
@@ -38,6 +39,10 @@ def make_server(store, registry, runner, host="127.0.0.1", port=8766, web_root=N
     """Return an unstarted server; the caller owns serve_forever/shutdown."""
     if not _loopback(host):
         raise ValueError("任务工作台只能监听本机地址")
+    # This is a loopback service. Binding the numeric address avoids a forward
+    # lookup when callers use localhost, including machines with slow resolvers.
+    if host == "localhost":
+        host = "127.0.0.1"
     root = Path(web_root or Path(__file__).resolve().parent.parent / "web").resolve()
 
     class Handler(BaseHTTPRequestHandler):
@@ -263,6 +268,13 @@ def make_server(store, registry, runner, host="127.0.0.1", port=8766, web_root=N
     class Server(ThreadingHTTPServer):
         daemon_threads = True
         allow_reuse_address = True
+
+        def server_bind(self):
+            # HTTPServer.server_bind calls getfqdn(), which performs a blocking
+            # reverse DNS lookup even for 127.0.0.1. Nothing in this local app
+            # needs that hostname; set the required metadata from the socket.
+            TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
 
         def get_request(self):
             connection, address = super().get_request()
