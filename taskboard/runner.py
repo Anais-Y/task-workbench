@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +14,60 @@ from pathlib import Path
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def process_state(process_id):
+    """Read-only probe: never send a terminating signal or trust a reused PID.
+
+    A still-present PID/group remains blocked, even if that PID may have been
+    reused. EPERM and unavailable information mean unknown, never exited.
+    """
+    if type(process_id) is not int or process_id <= 1:
+        return 'unknown'
+    try:
+        os.kill(process_id, 0)
+        return 'alive'
+    except ProcessLookupError:
+        pass
+    except (PermissionError, OSError):
+        return 'unknown'
+    if os.name != 'posix':
+        return 'exited'
+    try:
+        # The adapter launches a new session; descendants may retain its group
+        # after the direct child has exited.
+        os.killpg(process_id, 0)
+        return 'alive'
+    except ProcessLookupError:
+        return 'exited'
+    except PermissionError:
+        # macOS can return EPERM for a vanished group. Read the OS process table
+        # rather than declaring success merely because the direct PID is gone.
+        try:
+            result = subprocess.run(['/bin/ps', '-A', '-o', 'pid=', '-o', 'pgid='],
+                                    capture_output=True, text=True, timeout=1)
+            if result.returncode != 0 or not result.stdout.strip():
+                return 'unknown'
+            rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
+            if any(len(row) != 2 or not all(value.isdigit() for value in row) for row in rows):
+                return 'unknown'
+            return 'alive' if any(process_id in (int(row[0]), int(row[1])) for row in rows) else 'exited'
+        except (OSError, subprocess.SubprocessError):
+            return 'unknown'
+    except OSError:
+        return 'unknown'
+
+
+def stop_failure_attention(process_id, state):
+    identity = f'记录的 PID：{process_id}。' if type(process_id) is int and process_id > 1 else 'Agent 未提供可核实的 PID。'
+    description = (identity + '\n先在活动监视器（macOS）或原 CLI 核对并结束对应 Agent，确认文件写入已停止。'
+        '\nPID 可能被系统复用，请核对进程身份，不要仅凭数字结束不明进程。')
+    if state == 'alive':
+        description += '\n系统仍检测到该 PID 或进程组；退出后会自动解除保护，目前不能人工跳过。'
+    else:
+        description += '\n工作台无法确认是否退出。只有你已核实 Agent 退出且文件写入停止后，才能选择“我已确认 Agent 退出”。'
+    description += '\n确认前不能重试、继续这组任务、调整节点或删除项目。'
+    return {'badge': '需确认 Agent 停止', 'title': '未能确认 Agent 已退出', 'description': description}
 
 
 def parse_plan(text):
@@ -70,6 +127,7 @@ class Runner:
         self._stop = threading.Event()
         self._active = {}
         self._thread = None
+        self._process_checks = {}
 
     def start(self):
         with self._lock:
@@ -104,6 +162,11 @@ class Runner:
                        for task_id, item in self._active.items()]
             seen = {w['id'] for w in workers}
             for task in self.store.list_tasks():
+                if task.get('cancelFailed') and task['id'] not in self._active:
+                    name = task.get('unconfirmedWorker') or '待确认 ' + task['id']
+                    workers.append({'id': name, 'name': name, 'taskId': task['id'], 'engine': task['engine'],
+                                    'status': 'unconfirmed', 'source': 'local', 'processId': task.get('processId')})
+                    seen.add(name)
                 name = task.get('worker')
                 if task.get('executionMode') == 'external' and task['status'] == 'running' and name and name not in seen:
                     seen.add(name)
@@ -114,7 +177,68 @@ class Runner:
     def _available(self, engine):
         adapter = next((a for a in self.registry.list_adapters() if a['id'] == engine), None)
         if not adapter or not adapter.get('available') or not adapter.get('enabled', True):
-            raise ValueError('这个执行器尚未安装或启用，请在执行器页面查看。')
+            raise ValueError('这个 Agent 尚未安装或启用，请在 Agent 页面查看。')
+
+    def _family_root(self, item):
+        seen = set()
+        while item and item.get('parentTaskId') and item['id'] not in seen:
+            seen.add(item['id'])
+            parent = self.store.get_task(item['parentTaskId'])
+            if not parent:
+                break
+            item = parent
+        return item['id'] if item else None
+
+    def _refresh_stop_failure(self, task):
+        if not task.get('cancelFailed'):
+            return task
+        self._process_checks[task['id']] = time.monotonic()
+        state = process_state(task.get('processId'))
+        if state == 'exited':
+            return self.store.add_event(task['id'], '已确认先前 Agent 的 PID 和进程组均已退出，解除停止保护。',
+                cancelFailed=False, processState='exited', processStoppedAt=now(), attention=None,
+                unconfirmedWorker=None, error='先前停止失败；现在已确认 Agent 退出，可以重试。')
+        if state != task.get('processState'):
+            attention = stop_failure_attention(task.get('processId'), state)
+            return self.store.add_event(task['id'], 'Agent 退出核实状态：' + ('仍检测到进程。' if state == 'alive' else '无法确认。'),
+                processState=state, attention=attention, error=attention['description'])
+        return task
+
+    def _require_stopped(self, tasks):
+        for task in tasks:
+            current = self._refresh_stop_failure(task)
+            if current.get('cancelFailed'):
+                raise ValueError('任务“' + current['title'] + '”尚未确认 Agent 已停止。\n' +
+                                 stop_failure_attention(current.get('processId'), current.get('processState'))['description'])
+
+    def _require_family_stopped(self, task):
+        root = self._family_root(task)
+        self._require_stopped([item for item in self.store.list_tasks() if self._family_root(item) == root])
+
+    def handle_project_action(self, project_id, action):
+        # Share the scheduler lock so a queued task cannot start during deletion.
+        with self._lock:
+            if action == 'delete':
+                if any(self.store.get_task(task_id)['projectId'] == project_id for task_id in self._active):
+                    raise ValueError('项目仍有 worker 正在退出，请等待任务停止后再删除。')
+                self._require_stopped([task for task in self.store.list_tasks() if task['projectId'] == project_id])
+                return self.store.delete_project(project_id)
+            if action == 'restore':
+                return self.store.restore_project(project_id)
+            raise ValueError('项目操作必须是 delete 或 restore。')
+
+    def assign_task_node(self, task_id, node_id):
+        with self._lock:
+            task = self.store.get_task(task_id)
+            if not task:
+                raise KeyError('找不到任务')
+            # A just-cancelled process can still be cleaning up; don't move the
+            # family until its worker has actually released its workspace.
+            family_id = self._family_root(task)
+            if any(self._family_root(self.store.get_task(active_id)) == family_id for active_id in self._active):
+                raise ValueError('这组任务仍有 worker 正在运行，请等待任务停止后调整节点。')
+            self._require_family_stopped(task)
+            return self.store.assign_task_node(task_id, node_id)
 
     def handle_action(self, task_id, action, payload=None):
         payload = payload or {}
@@ -122,6 +246,29 @@ class Runner:
             task = self.store.get_task(task_id)
             if not task:
                 raise KeyError('找不到任务')
+            project = self.store.get_project(task['projectId'])
+            if not project or project.get('deletedAt'):
+                raise ValueError('项目已在回收站，请先恢复项目。')
+            if action == 'confirm_stopped':
+                if payload.get('confirmStopped') is not True:
+                    raise ValueError('请先核实对应 Agent 已退出且文件写入停止，再明确确认。')
+                if not task.get('cancelFailed'):
+                    raise ValueError('这个任务没有待确认的停止失败。')
+                if task_id in self._active:
+                    raise ValueError('worker 仍在处理停止请求，请稍后再核实。')
+                task = self._refresh_stop_failure(task)
+                if not task.get('cancelFailed'):
+                    return task
+                if task.get('processState') == 'alive':
+                    raise ValueError('系统仍检测到该 PID 或进程组，不能人工确认退出；请核对并结束对应 Agent。')
+                return self.store.add_event(task_id, '用户明确确认对应 Agent 已退出，且文件写入已经停止。',
+                    cancelFailed=False, processState='user_confirmed', processStoppedAt=now(), attention=None,
+                    unconfirmedWorker=None, error='用户已确认 Agent 退出，可以重试。')
+            if task.get('cancelFailed'):
+                self._require_stopped([task])
+                task = self.store.get_task(task_id)
+            if action in ('start', 'retry', 'feedback', 'approve_plan'):
+                self._require_family_stopped(task)
             external = task.get('executionMode') == 'external'
             state = task['status']
             if action == 'accept':
@@ -141,6 +288,7 @@ class Runner:
                 for item in plan:
                     child = self.store.create_task({'title': item['title'], 'goal': item['goal'], 'desc': item['goal'],
                         'criteria': item['criteria'], 'projectId': task['projectId'], 'engine': task['engine'],
+                        'nodeId': task.get('nodeId'),
                         'phase': 'execute', 'kind': 'result', 'parentTaskId': task_id,
                         'executionMode': 'local', 'scheduled': False, 'steps': item['criteria']})
                     children.append(child)
@@ -169,7 +317,8 @@ class Runner:
                 engine = payload.get('engine', task['engine'])
                 self._available(engine)
                 return self.store.add_event(task_id, '反馈已加入下一轮：' + message, status='queued', error='',
-                    scheduled=True, feedback=message, worker=None, engine=engine)
+                    scheduled=True, feedback=message, worker=None, engine=engine, cancelFailed=False,
+                    processId=None, processState=None, attention=None, unconfirmedWorker=None)
             if action in ('start', 'retry'):
                 if task_id in self._active:
                     raise ValueError('上一次执行正在停止，请稍后重试。')
@@ -177,11 +326,12 @@ class Runner:
                 if state not in allowed:
                     raise ValueError('当前状态不能执行这个操作。')
                 if external:
-                    raise ValueError('这是外部协作任务，由当前 Codex 对话协调；本地执行器不能重复启动它。')
+                    raise ValueError('这是外部协作任务，由当前 Codex 对话协调；本机 Agent 不能重复启动它。')
                 engine = payload.get('engine', task['engine'])
                 self._available(engine)
                 return self.store.add_event(task_id, '已加入执行队列。', scheduled=True, error='',
-                                            status='queued', engine=engine, worker=None, cancelRequested=False)
+                    status='queued', engine=engine, worker=None, cancelRequested=False, cancelFailed=False,
+                    processId=None, processState=None, attention=None, unconfirmedWorker=None)
             if action == 'cancel':
                 if state not in ('queued', 'running', 'review', 'failed'):
                     raise ValueError('当前状态不能取消。')
@@ -190,7 +340,7 @@ class Runner:
                 item = self._active.get(task_id)
                 if item:
                     item['cancel'].set()
-                    return self.store.add_event(task_id, '已请求停止任务，等待执行器退出。', scheduled=False, cancelRequested=True)
+                    return self.store.add_event(task_id, '已请求停止任务，等待 Agent 退出。', scheduled=False, cancelRequested=True)
                 return self.store.add_event(task_id, '任务已取消。', status='cancelled', scheduled=False, worker=None)
             raise ValueError('不支持的操作：' + str(action))
 
@@ -219,12 +369,19 @@ class Runner:
 
     def tick(self):
         with self._lock:
+            for task in self.store.list_tasks():
+                if task.get('cancelFailed') and time.monotonic() - self._process_checks.get(task['id'], 0) >= 2:
+                    self._refresh_stop_failure(task)
             self._reconcile_parents()
             tasks = self.store.list_tasks()
             by_id = {t['id']: t for t in tasks}
+            unconfirmed = [task for task in tasks if task.get('cancelFailed')]
+            blocked_families = {self._family_root(task) for task in unconfirmed}
             for task in tasks:
-                if self._stop.is_set() or len(self._active) >= self.max_workers:
+                if self._stop.is_set() or len(self._active) + len(unconfirmed) >= self.max_workers:
                     break
+                if self._family_root(task) in blocked_families:
+                    continue
                 if task['status'] != 'queued' or not task.get('scheduled') or task.get('executionMode') != 'local':
                     continue
                 if task['id'] in self._active:
@@ -240,7 +397,7 @@ class Runner:
                 except Exception as exc:
                     self.store.add_event(task['id'], str(exc), status='failed', scheduled=False, error=str(exc))
                     continue
-                used = {item['worker'] for item in self._active.values()}
+                used = {item['worker'] for item in self._active.values()} | {item.get('unconfirmedWorker') for item in unconfirmed}
                 slot = next('Worker %d' % i for i in range(1, self.max_workers + 1) if 'Worker %d' % i not in used)
                 run_id = uuid.uuid4().hex[:12]
                 runs = task.get('runs', []) + [{'id': run_id, 'engine': task['engine'], 'startedAt': now(),
@@ -257,6 +414,15 @@ class Runner:
         criteria = '\n'.join('- ' + str(x) for x in task.get('criteria', []))
         prompt = '任务：' + task['title'] + '\n目标：' + (task.get('goal') or task.get('desc') or task['title'])
         prompt += '\n验收标准：\n' + criteria
+        node = self.store.get_node(task['nodeId']) if task.get('nodeId') else None
+        if node:
+            prompt += '\n所属探索节点：' + node['title'] + '\n探索假设：' + node.get('hypothesis', '')
+            if node.get('conclusion'):
+                prompt += '\n该节点已记录的结论（供复核）：' + node['conclusion'][-6000:]
+            for parent_id in node.get('parentIds', []):
+                parent = self.store.get_node(parent_id)
+                if parent:
+                    prompt += '\n前序探索：' + parent['title'] + '\n结论：' + (parent.get('conclusion') or '尚未记录结论')[-6000:]
         if task.get('deps'):
             prompt += '\n已验收的前置任务：\n'
             for dep_id in task['deps']:
@@ -298,7 +464,7 @@ class Runner:
                 runs = current.get('runs', [])
                 cancelled = not result.get('cancelFailed') and (
                     cancellation.is_set() or result.get('cancelled') or current['status'] == 'cancelled')
-                ok = bool(result.get('ok')) and not cancelled
+                ok = bool(result.get('ok')) and not cancelled and not result.get('cancelFailed')
                 patch = {'scheduled': False, 'worker': None, 'runs': runs, 'cancelRequested': False,
                          'result': str(result.get('text', ''))[-200000:]}
                 if result.get('sessionId'):
@@ -306,7 +472,18 @@ class Runner:
                 if runs:
                     runs[-1] = dict(runs[-1], endedAt=now(), status='cancelled' if cancelled else 'review' if ok else 'failed',
                                     sessionId=result.get('sessionId'))
-                if cancelled:
+                if result.get('cancelFailed'):
+                    pid = result.get('processId')
+                    pid = pid if type(pid) is int and pid > 1 else None
+                    state = process_state(pid)
+                    attention = stop_failure_attention(pid, state)
+                    patch.update(status='failed', cancelFailed=True, processId=pid,
+                        processState=state if state != 'exited' else 'unknown', attention=attention,
+                        unconfirmedWorker=current.get('worker'), error=str(result.get('error') or '停止 Agent 失败') + '\n' + attention['description'])
+                    if runs:
+                        runs[-1].update(cancelFailed=True, processId=pid)
+                    message = '停止失败，需要确认 Agent 已退出。\n' + patch['error']
+                elif cancelled:
                     patch.update(status='cancelled')
                     message = '任务已停止。'
                 elif not ok:
@@ -321,7 +498,7 @@ class Runner:
                     artifacts.append({'name': '执行结果-' + str(len(runs)) + '.md', 'type': 'markdown', 'body': patch['result']})
                     # Keep references to actual existing changed files, when reported by a provider.
                     patch['artifacts'] = artifacts[-100:]
-                    message = '执行器已返回结果，等待验收。'
+                    message = 'Agent 已返回结果，等待验收。'
                     if task.get('phase') == 'plan':
                         try:
                             patch.update(plan=parse_plan(patch['result']), kind='plan')

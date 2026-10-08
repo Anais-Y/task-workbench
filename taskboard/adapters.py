@@ -402,15 +402,15 @@ class AdapterRegistry:
         try:
             item = self._adapters.get(engine)
             if item is None:
-                raise ValueError(f"未注册执行器：{engine}")
+                raise ValueError(f"未注册 Agent：{engine}")
             if not item["enabled"]:
-                raise ValueError("此执行器尚未启用")
+                raise ValueError("此 Agent 尚未启用")
             if not item["executable"]:
                 raise ValueError(f"未找到 {item['name']} 可执行文件")
             if phase not in {"plan", "execute"}:
                 raise ValueError("任务阶段必须是 plan 或 execute")
             if phase == "plan" and "plan" not in item["capabilities"]:
-                raise ValueError("此自定义执行器未配置计划模式；请配置 planArgs 或直接创建执行任务。")
+                raise ValueError("此自定义 Agent 未配置计划模式；请配置 planArgs 或直接创建执行任务。")
             cwd = str(Path(cwd).expanduser().resolve(strict=True))
             if not Path(cwd).is_dir():
                 raise ValueError("项目工作区必须是文件夹")

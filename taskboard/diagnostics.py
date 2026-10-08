@@ -65,9 +65,9 @@ def diagnose(url='http://127.0.0.1:8766', config_path=None):
     except (OSError, ValueError, TypeError) as exc:
         config.update(loaded=False, error=str(exc), customCount=0)
         report['ok'] = False
-        report['warnings'].append('自定义执行器配置无法载入；请修正配置后启动服务。')
+        report['warnings'].append('自定义 Agent 配置无法载入；请修正配置后启动服务。')
     if config.get('loaded') and not any(item.get('available') and item.get('enabled') for item in report['adapters']):
-        report['warnings'].append('未发现已启用的 CLI。工作台仍可打开；执行任务前需安装或配置一个执行器。')
+        report['warnings'].append('未发现已启用的 CLI。工作台仍可打开；执行任务前需安装或配置一个 Agent。')
     if report['service']['status'] == 'unexpected':
         report['warnings'].append('检查端口是否被其他应用占用，或选择另一个端口。')
     if not supported_python:
@@ -88,7 +88,7 @@ def format_report(report):
              f"系统：{system['name']} {system['release']} / {system['machine']}",
              f"支持范围：{system['support']}", f"仓库位置：{report['workspace']}",
              f"本机服务：{service['url']} · {service['message']}",
-             '执行器配置：' + (config['path'] or '未配置，使用内置发现')]
+             'Agent 配置：' + (config['path'] or '未配置，使用内置发现')]
     if config.get('error'):
         lines.append('配置错误：' + config['error'])
     for item in report['adapters']:

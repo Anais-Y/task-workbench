@@ -177,11 +177,14 @@ def make_server(store, registry, runner, host="127.0.0.1", port=8766, web_root=N
                 for _ in range(4):
                     version = store.version()
                     projects, tasks = store.list_projects(), store.list_tasks()
+                    nodes, trajectory = store.list_nodes(), store.list_trajectory()
+                    deleted_projects = [project for project in store.list_projects(include_deleted=True) if project.get("deletedAt")]
                     if version == store.version():
                         break
                 snapshot = runner.snapshot() or {}
                 self._json(200, {
                     "projects": projects, "tasks": tasks,
+                    "nodes": nodes, "trajectory": trajectory, "deletedProjects": deleted_projects,
                     "adapters": registry.list_adapters(),
                     "workers": snapshot.get("workers", []),
                     "maxWorkers": snapshot.get("maxWorkers", 3), "version": version,
@@ -215,6 +218,20 @@ def make_server(store, registry, runner, host="127.0.0.1", port=8766, web_root=N
             if path == "/api/projects":
                 self._json(201, store.create_project(data))
                 return
+            match = re.fullmatch(r"/api/projects/([A-Za-z0-9_.-]+)/actions", path)
+            if match:
+                action = data.get("action")
+                if action not in ("delete", "restore"):
+                    raise ValueError("项目操作必须是 delete 或 restore")
+                self._json(200, runner.handle_project_action(match.group(1), action))
+                return
+            if path == "/api/nodes":
+                self._json(201, store.create_node(data))
+                return
+            match = re.fullmatch(r"/api/nodes/([A-Za-z0-9_.-]+)", path)
+            if match:
+                self._json(200, store.update_node(match.group(1), data))
+                return
             if path == "/api/tasks":
                 start = data.pop("start", False)
                 if not isinstance(start, bool):
@@ -223,6 +240,12 @@ def make_server(store, registry, runner, host="127.0.0.1", port=8766, web_root=N
                 if start:
                     task = runner.handle_action(task["id"], "start", {})
                 self._json(201, task)
+                return
+            match = re.fullmatch(r"/api/tasks/([A-Za-z0-9_.-]+)/node", path)
+            if match:
+                if "nodeId" not in data:
+                    raise ValueError("请提供 nodeId，取消分组时使用空值")
+                self._json(200, runner.assign_task_node(match.group(1), data["nodeId"]))
                 return
             match = re.fullmatch(r"/api/tasks/([A-Za-z0-9_.-]+)/actions", path)
             if match:
@@ -240,7 +263,7 @@ def make_server(store, registry, runner, host="127.0.0.1", port=8766, web_root=N
             except HTTPError as exc:
                 self._json(exc.status, {"error": exc.message})
             except KeyError:
-                self._json(404, {"error": "任务或项目不存在"})
+                self._json(404, {"error": "任务、项目或节点不存在"})
             except ValueError as exc:
                 self._json(400, {"error": str(exc)})
             except PermissionError:

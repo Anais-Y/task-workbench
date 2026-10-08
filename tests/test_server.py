@@ -17,6 +17,7 @@ class FakeRegistry:
 class FakeRunner:
     def __init__(self, store):
         self.store = store
+        self.calls = []
 
     def snapshot(self):
         return {"workers": [], "maxWorkers": 3}
@@ -25,6 +26,14 @@ class FakeRunner:
         if action != "start":
             raise ValueError("未知操作")
         return self.store.update_task(task_id, {"scheduled": True})
+
+    def handle_project_action(self, project_id, action):
+        self.calls.append(("project", project_id, action))
+        return self.store.delete_project(project_id) if action == "delete" else self.store.restore_project(project_id)
+
+    def assign_task_node(self, task_id, node_id):
+        self.calls.append(("node", task_id, node_id))
+        return self.store.assign_task_node(task_id, node_id)
 
 
 class ServerTests(unittest.TestCase):
@@ -38,7 +47,8 @@ class ServerTests(unittest.TestCase):
         (self.web / "index.html").write_text("<!doctype html><h1>任务工作台</h1>", encoding="utf-8")
         self.store = Store(self.path / "state.sqlite3")
         self.project = self.store.create_project({"name": "建立一个任务管理器", "path": str(self.workspace)})
-        self.server = make_server(self.store, FakeRegistry(), FakeRunner(self.store), port=0, web_root=self.web)
+        self.runner = FakeRunner(self.store)
+        self.server = make_server(self.store, FakeRegistry(), self.runner, port=0, web_root=self.web)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -133,6 +143,68 @@ class ServerTests(unittest.TestCase):
             self.assertIn("error", json.loads(content))
         status, _, _ = self.request("GET", "/%2e%2e/state.sqlite3")
         self.assertEqual(status, 403)
+
+    def test_nodes_family_assignment_and_trajectory_via_api(self):
+        status, _, content = self.request("POST", "/api/nodes", {"title": "语义检索方向",
+            "projectId": self.project["id"], "hypothesis": "待验证假设", "color": "violet"})
+        self.assertEqual(status, 201)
+        node = json.loads(content)
+        parent = self.store.create_task({"title": "父任务", "projectId": self.project["id"]})
+        child = self.store.create_task({"title": "子任务", "projectId": self.project["id"], "parentTaskId": parent["id"]})
+        status, _, content = self.request("POST", f"/api/tasks/{child['id']}/node", {"nodeId": node["id"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(content)["nodeId"], node["id"])
+        self.assertEqual(self.store.get_task(parent["id"])["nodeId"], node["id"])
+        self.assertEqual(self.runner.calls[-1], ("node", child["id"], node["id"]))
+        status, _, content = self.request("POST", f"/api/nodes/{node['id']}",
+            {"outcome": "adopted", "conclusion": "实验结论第一版"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(content)["conclusion"], "实验结论第一版")
+        status, _, content = self.request("GET", "/api/state")
+        state = json.loads(content)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(state["nodes"]), 1)
+        self.assertEqual(state["deletedProjects"], [])
+        self.assertIn("node_conclusion", [event["type"] for event in state["trajectory"]])
+        status, _, content = self.request("POST", f"/api/tasks/{parent['id']}/node", {"nodeId": None})
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.store.get_task(child["id"])["nodeId"])
+
+    def test_project_delete_and_restore_via_runner_hide_state(self):
+        task = self.store.create_task({"title": "保留任务", "projectId": self.project["id"]})
+        route = f"/api/projects/{self.project['id']}/actions"
+        status, _, content = self.request("POST", route, {"action": "delete"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(content)["deletedAt"])
+        self.assertEqual(self.runner.calls[-1], ("project", self.project["id"], "delete"))
+        _, _, content = self.request("GET", "/api/state")
+        state = json.loads(content)
+        self.assertEqual(state["projects"], [])
+        self.assertEqual(state["tasks"], [])
+        self.assertEqual(state["trajectory"], [])
+        self.assertEqual(len(state["deletedProjects"]), 1)
+        status, _, _ = self.request("POST", route, {"action": "restore"})
+        self.assertEqual(status, 200)
+        _, _, content = self.request("GET", "/api/state")
+        state = json.loads(content)
+        self.assertEqual(state["tasks"], [task])
+        self.assertEqual(state["deletedProjects"], [])
+        self.assertEqual(state["trajectory"][-1]["type"], "project_restored")
+
+    def test_exploration_routes_reject_invalid_or_unauthorized_changes(self):
+        task = self.store.create_task({"title": "保留任务", "projectId": self.project["id"], "scheduled": True})
+        status, _, content = self.request("POST", f"/api/projects/{self.project['id']}/actions", {"action": "delete"})
+        self.assertEqual(status, 400)
+        self.assertIn("已排队", json.loads(content)["error"])
+        status, _, _ = self.request("POST", "/api/nodes", {"title": "节点", "projectId": self.project["id"]},
+            {"X-Taskboard-Client": ""})
+        self.assertEqual(status, 403)
+        for payload in ({}, {"nodeId": 123}, {"nodeId": "missing"}):
+            status, _, content = self.request("POST", f"/api/tasks/{task['id']}/node", payload)
+            self.assertEqual(status, 400)
+            self.assertIn("error", json.loads(content))
+        status, _, _ = self.request("POST", "/api/nodes/missing", {"title": "不存在"})
+        self.assertEqual(status, 404)
 
 
 if __name__ == "__main__":

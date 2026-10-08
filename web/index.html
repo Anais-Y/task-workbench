@@ -11,7 +11,9 @@
 <body>
 <main id="task-workbench" aria-label="任务工作台">
   <div class="tw-proto"><span id="tw-connection" class="tw-connection"><span class="tw-dot"></span>本机工作台 · 正在连接</span><span class="tw-sync"><span id="tw-last-sync">等待首次同步</span><button id="tw-refresh" type="button">刷新</button></span></div>
-  <div class="tw-header"><div><div class="tw-kicker">PERSONAL WORKSPACE</div><div class="tw-flex tw-wrap"><h2>任务工作台</h2><select id="tw-project-filter" class="tw-project-picker" aria-label="切换项目"></select></div><div class="tw-header-sub">让任务持续推进，把需要你决定的事留下来。</div></div><div class="tw-flex tw-wrap"><button class="tw-workers" id="tw-workers" type="button" aria-label="查看 worker 状态">查看执行者</button><button id="tw-adapters" type="button" class="tw-btn">执行器</button><button id="tw-new" type="button" class="tw-btn tw-primary">＋ 新建任务</button></div></div>
+  <div class="tw-header"><div><div class="tw-kicker">PERSONAL WORKSPACE</div><div class="tw-flex tw-wrap"><h2>任务工作台</h2><select id="tw-project-filter" class="tw-project-picker" aria-label="切换项目"></select></div><div class="tw-header-sub">让任务持续推进，把需要你决定的事留下来。</div></div><div class="tw-flex tw-wrap"><button class="tw-workers" id="tw-workers" type="button" aria-label="查看 worker 状态">查看 worker</button><button id="tw-adapters" type="button" class="tw-btn">Agent</button><button id="tw-new" type="button" class="tw-btn tw-primary">＋ 新建任务</button></div></div>
+  <nav id="tw-sections" class="tw-sections" aria-label="工作台视图"></nav>
+  <div id="tw-node-filters" class="tw-node-filters" hidden></div>
   <nav id="tw-navigation" class="tw-toolbar" aria-label="任务筛选"></nav>
   <div id="tw-message" class="tw-notice" role="status" hidden></div>
   <div id="tw-content"><div class="tw-loader">正在读取本机任务…</div></div>
